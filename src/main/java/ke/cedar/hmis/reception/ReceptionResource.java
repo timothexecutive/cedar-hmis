@@ -1,5 +1,6 @@
 package ke.cedar.hmis.reception;
 
+import jakarta.annotation.security.RolesAllowed;
 import jakarta.inject.Inject;
 import jakarta.transaction.Transactional;
 import jakarta.ws.rs.*;
@@ -15,7 +16,6 @@ public class ReceptionResource {
     @Inject
     ReceptionService receptionService;
 
-    // ── PING ─────────────────────────────────────────
     @GET
     @Path("/ping")
     @Produces(MediaType.TEXT_PLAIN)
@@ -23,28 +23,28 @@ public class ReceptionResource {
         return "Cedar HMIS — Reception module is alive!";
     }
 
-    // ── REGISTER new patient ──────────────────────────
     @POST
     @Path("/patients")
     @Transactional
+    @RolesAllowed({"RECEPTIONIST", "NURSE", "DOCTOR", "ADMIN"})
     public Response registerPatient(Patient patient) {
         Patient saved = receptionService.registerPatient(patient);
         return Response.status(201).entity(saved).build();
     }
 
-    // ── SEARCH / list all patients ────────────────────
     @GET
     @Path("/patients")
+    @RolesAllowed({"RECEPTIONIST", "NURSE", "DOCTOR", "ADMIN",
+                   "CASHIER", "LAB_TECH", "PHARMACIST"})
     public List<Patient> searchPatients(@QueryParam("q") String query) {
         return receptionService.searchPatients(query);
     }
 
-    // ── GET single patient by ID ──────────────────────
     @GET
     @Path("/patients/{id}")
+    @RolesAllowed({"RECEPTIONIST", "NURSE", "DOCTOR", "ADMIN",
+                   "CASHIER", "LAB_TECH", "PHARMACIST"})
     public Patient getPatient(@PathParam("id") Long id) {
         return receptionService.getPatient(id);
     }
 }
-
-

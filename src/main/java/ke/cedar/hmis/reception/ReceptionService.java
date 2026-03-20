@@ -12,28 +12,20 @@ public class ReceptionService {
 
     @Transactional
     public Patient registerPatient(Patient request) {
-
-        // Check duplicate national ID
         if (request.nationalId != null && !request.nationalId.isBlank()) {
             Patient existing = Patient.findByNationalId(request.nationalId);
             if (existing != null) {
                 throw new WebApplicationException(
                     Response.status(409)
                         .entity("{\"error\":\"Patient with this National ID already exists\"}")
-                        .build()
-                );
+                        .build());
             }
         }
-
-        // Auto-generate patient number e.g. CDR-2026-00001
         long count = Patient.countActive() + 1;
         request.patientNo = String.format("CDR-%d-%05d",
                 Year.now().getValue(), count);
-
-        // Set SHA membership flag
         request.isSHAMember = request.shaMemberNo != null
                 && !request.shaMemberNo.isBlank();
-
         request.persist();
         return request;
     }
@@ -51,8 +43,7 @@ public class ReceptionService {
             throw new WebApplicationException(
                 Response.status(404)
                     .entity("{\"error\":\"Patient not found\"}")
-                    .build()
-            );
+                    .build());
         }
         return p;
     }

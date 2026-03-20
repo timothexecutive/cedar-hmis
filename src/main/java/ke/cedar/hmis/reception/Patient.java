@@ -62,7 +62,6 @@ public class Patient extends PanacheEntity {
         updatedAt = LocalDateTime.now();
     }
 
-    // ── Queries ───────────────────────────────────────
     public static Patient findByNationalId(String id) {
         return find("nationalId", id).firstResult();
     }
