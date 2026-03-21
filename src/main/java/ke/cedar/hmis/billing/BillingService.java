@@ -32,8 +32,7 @@ public class BillingService {
         String invNo = "INV-" +
             LocalDateTime.now()
                 .format(DateTimeFormatter.ofPattern("yyyyMMdd"))
-            + "-" + String.format("%04d",
-                Invoice.count() + 1);
+            + "-" + String.format("%04d", Invoice.count() + 1);
 
         Invoice invoice       = new Invoice();
         invoice.invoiceNo     = invNo;
@@ -54,18 +53,17 @@ public class BillingService {
 
         invoice.persist();
 
-        // Add line items and calculate totals
         BigDecimal subtotal = BigDecimal.ZERO;
         for (Map<String, Object> item : items) {
-            InvoiceItem invItem  = new InvoiceItem();
-            invItem.invoice      = invoice;
-            invItem.description  = (String) item.get("description");
-            invItem.category     = (String) item.get("category");
-            invItem.quantity     = Integer.parseInt(
+            InvoiceItem invItem = new InvoiceItem();
+            invItem.invoice     = invoice;
+            invItem.description = (String) item.get("description");
+            invItem.category    = (String) item.get("category");
+            invItem.quantity    = Integer.parseInt(
                 item.get("quantity").toString());
-            invItem.unitPrice    = new BigDecimal(
+            invItem.unitPrice   = new BigDecimal(
                 item.get("unitPrice").toString());
-            invItem.total        = invItem.unitPrice.multiply(
+            invItem.total       = invItem.unitPrice.multiply(
                 BigDecimal.valueOf(invItem.quantity));
             invItem.persist();
             subtotal = subtotal.add(invItem.total);
@@ -93,22 +91,42 @@ public class BillingService {
                     .build());
         }
 
+        // ── FIX 2: Block payment on locked invoice ────
+        if (invoice.status.equals("VOID")) {
+            throw new WebApplicationException(
+                Response.status(409)
+                    .entity("{\"error\":\"Cannot pay a voided invoice\"}")
+                    .build());
+        }
+
+        if (invoice.status.equals("PAID")) {
+            throw new WebApplicationException(
+                Response.status(409)
+                    .entity("{\"error\":\"Invoice is already fully paid\"}")
+                    .build());
+        }
+
+        // ── FIX 3: Auto-generate receipt number ───────
+        String receiptNo = "RCP-" +
+            LocalDateTime.now()
+                .format(DateTimeFormatter.ofPattern("yyyyMMdd"))
+            + "-" + String.format("%04d", Payment.count() + 1);
+
         Payment payment       = new Payment();
         payment.invoice       = invoice;
         payment.paymentMethod = method;
         payment.amount        = amount;
         payment.referenceNo   = referenceNo;
+        payment.receiptNo     = receiptNo;
         payment.cashier       = cashier;
         payment.verified      = method.equals("CASH");
         payment.persist();
 
-        // Update invoice totals — balance cannot go below zero
         invoice.paidAmount = invoice.paidAmount.add(amount);
         invoice.balance    = invoice.totalAmount
             .subtract(invoice.paidAmount)
             .max(BigDecimal.ZERO);
-
-        invoice.status = invoice.balance
+        invoice.status     = invoice.balance
             .compareTo(BigDecimal.ZERO) <= 0 ? "PAID" : "PARTIAL";
         invoice.persist();
 
@@ -127,7 +145,6 @@ public class BillingService {
                     .build());
         }
 
-        // ── FRAUD CHECK: block payment on already paid invoice ──
         if (invoice.status.equals("PAID")) {
             throw new WebApplicationException(
                 Response.status(409)
@@ -135,12 +152,39 @@ public class BillingService {
                     .build());
         }
 
+        if (invoice.status.equals("VOID")) {
+            throw new WebApplicationException(
+                Response.status(409)
+                    .entity("{\"error\":\"Cannot pay a voided invoice\"}")
+                    .build());
+        }
+
+        // ── FIX 1: Block duplicate pending M-Pesa ─────
+        long pendingMpesa = Payment.count(
+            "invoice.id = ?1 AND paymentMethod = 'MPESA' " +
+            "AND verified = false", invoiceId);
+        if (pendingMpesa > 0) {
+            throw new WebApplicationException(
+                Response.status(409)
+                    .entity("{\"error\":\"A pending M-Pesa payment already " +
+                            "exists for this invoice. Wait for confirmation " +
+                            "or cancel it first.\"}")
+                    .build());
+        }
+
+        // ── FIX 3: Auto-generate receipt number ───────
+        String receiptNo = "RCP-" +
+            LocalDateTime.now()
+                .format(DateTimeFormatter.ofPattern("yyyyMMdd"))
+            + "-" + String.format("%04d", Payment.count() + 1);
+
         Payment payment       = new Payment();
         payment.invoice       = invoice;
         payment.paymentMethod = "MPESA";
         payment.amount        = invoice.balance;
         payment.phoneNumber   = phone;
         payment.cashier       = cashier;
+        payment.receiptNo     = receiptNo;
         payment.verified      = false;
         payment.persist();
 
@@ -160,7 +204,6 @@ public class BillingService {
         payment.verified     = true;
         payment.persist();
 
-        // Update invoice — balance cannot go below zero
         Invoice invoice    = payment.invoice;
         invoice.paidAmount = invoice.paidAmount.add(payment.amount);
         invoice.balance    = invoice.totalAmount
@@ -169,6 +212,114 @@ public class BillingService {
         invoice.status     = invoice.balance
             .compareTo(BigDecimal.ZERO) <= 0 ? "PAID" : "PARTIAL";
         invoice.persist();
+    }
+
+    // ── FIX 4: Void invoice — admin only ──────────────
+    @Transactional
+    public Invoice voidInvoice(Long invoiceId,
+            String reason, String voidedBy) {
+
+        Invoice invoice = Invoice.findById(invoiceId);
+        if (invoice == null) {
+            throw new WebApplicationException(
+                Response.status(404)
+                    .entity("{\"error\":\"Invoice not found\"}")
+                    .build());
+        }
+
+        if (invoice.status.equals("PAID")) {
+            throw new WebApplicationException(
+                Response.status(409)
+                    .entity("{\"error\":\"Cannot void a paid invoice. " +
+                            "Issue a refund instead.\"}")
+                    .build());
+        }
+
+        if (invoice.status.equals("VOID")) {
+            throw new WebApplicationException(
+                Response.status(409)
+                    .entity("{\"error\":\"Invoice is already voided\"}")
+                    .build());
+        }
+
+        if (reason == null || reason.isBlank()) {
+            throw new WebApplicationException(
+                Response.status(400)
+                    .entity("{\"error\":\"Void reason is mandatory\"}")
+                    .build());
+        }
+
+        invoice.status   = "VOID";
+        invoice.notes    = "VOIDED by " + voidedBy +
+                           " | Reason: " + reason +
+                           " | Time: " + LocalDateTime.now();
+        invoice.persist();
+
+        return invoice;
+    }
+
+    // ── FIX 5: Cashier session ────────────────────────
+    @Transactional
+    public CashierSession openSession(String cashier,
+            BigDecimal openingFloat) {
+
+        // Block opening if session already open
+        long openSessions = CashierSession.count(
+            "cashier = ?1 AND status = 'OPEN'", cashier);
+        if (openSessions > 0) {
+            throw new WebApplicationException(
+                Response.status(409)
+                    .entity("{\"error\":\"Cashier already has an open session\"}")
+                    .build());
+        }
+
+        CashierSession session  = new CashierSession();
+        session.cashier         = cashier;
+        session.openingFloat    = openingFloat;
+        session.status          = "OPEN";
+        session.persist();
+
+        return session;
+    }
+
+    @Transactional
+    public CashierSession closeSession(Long sessionId,
+            BigDecimal actualCash) {
+
+        CashierSession session = CashierSession.findById(sessionId);
+        if (session == null) {
+            throw new WebApplicationException(
+                Response.status(404)
+                    .entity("{\"error\":\"Session not found\"}")
+                    .build());
+        }
+
+        if (session.status.equals("CLOSED")) {
+            throw new WebApplicationException(
+                Response.status(409)
+                    .entity("{\"error\":\"Session already closed\"}")
+                    .build());
+        }
+
+        // Calculate expected cash from all cash payments
+        // during this session
+        BigDecimal expectedCash = Payment.find(
+            "paymentMethod = 'CASH' AND verified = true " +
+            "AND createdAt >= ?1", session.openedAt)
+            .stream()
+            .map(p -> ((Payment) p).amount)
+            .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        session.expectedCash = expectedCash
+            .add(session.openingFloat);
+        session.actualCash   = actualCash;
+        session.variance     = actualCash
+            .subtract(session.expectedCash);
+        session.status       = "CLOSED";
+        session.closedAt     = LocalDateTime.now();
+        session.persist();
+
+        return session;
     }
 
     @Transactional
@@ -193,7 +344,6 @@ public class BillingService {
                     .build());
         }
 
-        // ── FRAUD CHECK: block duplicate claims on same invoice ──
         long existingClaims = InsuranceClaim.count(
             "invoice.id = ?1 AND status != 'REJECTED'", invoiceId);
         if (existingClaims > 0) {
@@ -203,7 +353,6 @@ public class BillingService {
                     .build());
         }
 
-        // ── FRAUD CHECK: claimed amount cannot exceed invoice total ──
         if (amount.compareTo(invoice.totalAmount) > 0) {
             throw new WebApplicationException(
                 Response.status(400)
@@ -211,7 +360,6 @@ public class BillingService {
                     .build());
         }
 
-        // ── FRAUD CHECK: cannot claim on fully cash-paid invoice ──
         if (invoice.status.equals("PAID") &&
                 invoice.paidAmount.compareTo(invoice.totalAmount) >= 0 &&
                 invoice.insuranceAmount.compareTo(BigDecimal.ZERO) == 0) {
@@ -227,17 +375,16 @@ public class BillingService {
             + "-" + String.format("%04d",
                 InsuranceClaim.count() + 1);
 
-        InsuranceClaim claim   = new InsuranceClaim();
-        claim.claimNo          = claimNo;
-        claim.invoice          = invoice;
-        claim.provider         = provider;
-        claim.patient          = invoice.patient;
-        claim.memberNo         = memberNo;
-        claim.amountClaimed    = amount;
-        claim.status           = "SUBMITTED";
+        InsuranceClaim claim = new InsuranceClaim();
+        claim.claimNo        = claimNo;
+        claim.invoice        = invoice;
+        claim.provider       = provider;
+        claim.patient        = invoice.patient;
+        claim.memberNo       = memberNo;
+        claim.amountClaimed  = amount;
+        claim.status         = "SUBMITTED";
         claim.persist();
 
-        // Update invoice insurance amount
         invoice.insuranceAmount = amount;
         invoice.patientAmount   = invoice.totalAmount.subtract(amount);
         invoice.balance         = invoice.patientAmount
@@ -261,7 +408,6 @@ public class BillingService {
                     .build());
         }
 
-        // ── FRAUD CHECK: approved amount cannot exceed claimed amount ──
         if (approvedAmount != null &&
                 approvedAmount.compareTo(claim.amountClaimed) > 0) {
             throw new WebApplicationException(
@@ -271,16 +417,10 @@ public class BillingService {
         }
 
         claim.status = status;
-        if (approvedAmount != null) {
-            claim.amountApproved = approvedAmount;
-        }
-        if (refNo != null) claim.claimRefNo = refNo;
-        if (rejectionReason != null) {
-            claim.rejectionReason = rejectionReason;
-        }
-        if (status.equals("APPROVED")) {
-            claim.approvalDate = LocalDateTime.now();
-        }
+        if (approvedAmount != null) claim.amountApproved = approvedAmount;
+        if (refNo != null)          claim.claimRefNo     = refNo;
+        if (rejectionReason != null) claim.rejectionReason = rejectionReason;
+        if (status.equals("APPROVED")) claim.approvalDate = LocalDateTime.now();
         if (status.equals("PAID")) {
             claim.paymentDate = LocalDateTime.now();
             claim.amountPaid  = claim.amountApproved;
@@ -296,4 +436,5 @@ public class BillingService {
     public List<InsuranceProvider> getProviders()               { return InsuranceProvider.findAllActive(); }
     public List<InsuranceClaim>    getClaimsByStatus(String s)  { return InsuranceClaim.findByStatus(s); }
     public List<InsuranceClaim>    getClaimsByProvider(Long p)  { return InsuranceClaim.findByProvider(p); }
+    public List<CashierSession>    getOpenSessions()            { return CashierSession.findOpen(); }
 }

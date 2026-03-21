@@ -121,31 +121,27 @@ public class BillingResource {
         Payment payment = billingService.initiateMpesaPayment(
             invoiceId, phone, cashier);
 
-        // Get invoice for amount
-        Invoice invoice = Invoice.findById(invoiceId);
-
-        // Initiate STK push
-        String result = mpesaService.initiateSTKPush(
+        // Fire STK push (sandbox returns fake ID, production calls Safaricom)
+        String checkoutRequestId = mpesaService.initiateSTKPush(
             phone,
-            invoice.balance.intValue(),
-            invoice.invoiceNo,
+            payment.amount.intValue(),
+            "INV-" + invoiceId,
             "Cedar Hospital Payment");
 
-        // Save checkoutRequestId so callback can find this payment
-        try {
-            if (result.contains("CheckoutRequestID")) {
-                String checkoutId = result
-                    .split("\"CheckoutRequestID\":\"")[1]
-                    .split("\"")[0];
-                payment.referenceNo = checkoutId;
-                payment.persist();
-            }
-        } catch (Exception e) {
-            System.err.println("Could not extract CheckoutRequestID: "
-                + e.getMessage());
-        }
+        // Store checkout request ID so callback can match it
+        payment.referenceNo = checkoutRequestId;
+        payment.persist();
 
-        return Response.ok(result).build();
+        return Response.status(201).entity(Map.of(
+            "message",           "STK Push sent to " + phone,
+            "checkoutRequestId", checkoutRequestId,
+            "invoiceId",         invoiceId,
+            "amount",            payment.amount,
+            "paymentMethod",     "MPESA",
+            "verified",          false,
+            "receiptNo",         payment.receiptNo != null ? payment.receiptNo : "",
+            "status",            "Waiting for customer to enter PIN"
+        )).build();
     }
 
     // ── M-PESA CALLBACK — public, Safaricom calls this ─
@@ -169,12 +165,12 @@ public class BillingResource {
             String resultDesc        = (String) stkCallback.get("ResultDesc");
 
             // Log the callback
-            MpesaCallback log       = new MpesaCallback();
-            log.merchantRequestId   = merchantRequestId;
-            log.checkoutRequestId   = checkoutRequestId;
-            log.resultCode          = resultCode;
-            log.resultDesc          = resultDesc;
-            log.rawPayload          = payload.toString();
+            MpesaCallback log     = new MpesaCallback();
+            log.merchantRequestId = merchantRequestId;
+            log.checkoutRequestId = checkoutRequestId;
+            log.resultCode        = resultCode;
+            log.resultDesc        = resultDesc;
+            log.rawPayload        = payload.toString();
 
             if (resultCode == 0) {
                 @SuppressWarnings("unchecked")
@@ -203,11 +199,11 @@ public class BillingResource {
 
                 log.mpesaReceipt = mpesaReceiptNo;
                 log.amount       = amount != null ?
-                    new java.math.BigDecimal(amount.toString()) : null;
+                    new BigDecimal(amount.toString()) : null;
                 log.phoneNumber  = phoneNumber;
                 log.processed    = true;
 
-                // Delegate to service — handles balance cap + status
+                // Mark payment verified + update invoice balance
                 billingService.verifyMpesaPayment(
                     checkoutRequestId,
                     mpesaReceiptNo,
@@ -264,5 +260,52 @@ public class BillingResource {
                 new BigDecimal(body.get("approvedAmount")) : null,
             body.get("refNo"),
             body.get("rejectionReason"));
+    }
+
+    // ── VOID invoice — admin only ─────────────────────
+    @PUT
+    @Path("/invoices/{invoiceId}/void")
+    @Transactional
+    @RolesAllowed({"ADMIN"})
+    public Response voidInvoice(
+            @PathParam("invoiceId") Long invoiceId,
+            Map<String, String> body) {
+        Invoice invoice = billingService.voidInvoice(
+            invoiceId,
+            body.get("reason"),
+            body.get("voidedBy"));
+        return Response.ok(invoice).build();
+    }
+
+    // ── CASHIER SESSION ───────────────────────────────
+    @POST
+    @Path("/sessions/open")
+    @Transactional
+    @RolesAllowed({"CASHIER", "ADMIN"})
+    public Response openSession(Map<String, String> body) {
+        CashierSession session = billingService.openSession(
+            body.get("cashier"),
+            new BigDecimal(body.get("openingFloat")));
+        return Response.status(201).entity(session).build();
+    }
+
+    @PUT
+    @Path("/sessions/{sessionId}/close")
+    @Transactional
+    @RolesAllowed({"CASHIER", "ADMIN"})
+    public Response closeSession(
+            @PathParam("sessionId") Long sessionId,
+            Map<String, String> body) {
+        CashierSession session = billingService.closeSession(
+            sessionId,
+            new BigDecimal(body.get("actualCash")));
+        return Response.ok(session).build();
+    }
+
+    @GET
+    @Path("/sessions/open")
+    @RolesAllowed({"CASHIER", "ADMIN"})
+    public List<CashierSession> getOpenSessions() {
+        return billingService.getOpenSessions();
     }
 }

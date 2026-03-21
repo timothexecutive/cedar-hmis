@@ -24,6 +24,9 @@ public class Payment extends PanacheEntity {
     @Column(name = "reference_no")
     public String referenceNo;
 
+    @Column(name = "receipt_no")
+    public String receiptNo;
+
     @Column(name = "mpesa_receipt")
     public String mpesaReceipt;
 
