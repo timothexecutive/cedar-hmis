@@ -4,6 +4,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.transaction.Transactional;
 import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.core.Response;
+import ke.cedar.hmis.audit.AuditTrail;
 import ke.cedar.hmis.reception.Patient;
 import ke.cedar.hmis.opd.Visit;
 import ke.cedar.hmis.ipd.Admission;
@@ -17,9 +18,11 @@ import java.util.Map;
 public class BillingService {
 
     @Transactional
-    public Invoice createInvoice(Long patientId, Long visitId,
-            Long admissionId, String invoiceType,
-            String createdBy, List<Map<String, Object>> items) {
+    public Invoice createInvoice(Long patientId,
+            Long visitId, Long admissionId,
+            String invoiceType, String createdBy,
+            List<Map<String, Object>> items,
+            Long userId, String userName) {
 
         Patient patient = Patient.findById(patientId);
         if (patient == null) {
@@ -30,43 +33,46 @@ public class BillingService {
         }
 
         String invNo = "INV-" +
-            LocalDateTime.now()
-                .format(DateTimeFormatter.ofPattern("yyyyMMdd"))
-            + "-" + String.format("%04d", Invoice.count() + 1);
+            LocalDateTime.now().format(
+                DateTimeFormatter.ofPattern("yyyyMMdd"))
+            + "-" + String.format("%04d",
+                Invoice.count() + 1);
 
-        Invoice invoice       = new Invoice();
-        invoice.invoiceNo     = invNo;
-        invoice.patient       = patient;
-        invoice.invoiceType   = invoiceType != null ? invoiceType : "OPD";
-        invoice.createdBy     = createdBy;
-        invoice.status        = "PENDING";
+        Invoice invoice     = new Invoice();
+        invoice.invoiceNo   = invNo;
+        invoice.patient     = patient;
+        invoice.invoiceType = invoiceType != null ?
+                invoiceType : "OPD";
+        invoice.createdBy   = userName;
+        invoice.status      = "PENDING";
 
         if (visitId != null) {
             Visit visit = Visit.findById(visitId);
             if (visit != null) invoice.visit = visit;
         }
-
         if (admissionId != null) {
-            Admission admission = Admission.findById(admissionId);
-            if (admission != null) invoice.admission = admission;
+            Admission adm = Admission.findById(admissionId);
+            if (adm != null) invoice.admission = adm;
         }
 
         invoice.persist();
 
         BigDecimal subtotal = BigDecimal.ZERO;
         for (Map<String, Object> item : items) {
-            InvoiceItem invItem = new InvoiceItem();
-            invItem.invoice     = invoice;
-            invItem.description = (String) item.get("description");
-            invItem.category    = (String) item.get("category");
-            invItem.quantity    = Integer.parseInt(
+            InvoiceItem inv = new InvoiceItem();
+            inv.invoice     = invoice;
+            inv.description =
+                (String) item.get("description");
+            inv.category    =
+                (String) item.get("category");
+            inv.quantity    = Integer.parseInt(
                 item.get("quantity").toString());
-            invItem.unitPrice   = new BigDecimal(
+            inv.unitPrice   = new BigDecimal(
                 item.get("unitPrice").toString());
-            invItem.total       = invItem.unitPrice.multiply(
-                BigDecimal.valueOf(invItem.quantity));
-            invItem.persist();
-            subtotal = subtotal.add(invItem.total);
+            inv.total       = inv.unitPrice.multiply(
+                BigDecimal.valueOf(inv.quantity));
+            inv.persist();
+            subtotal = subtotal.add(inv.total);
         }
 
         invoice.subtotal      = subtotal;
@@ -75,13 +81,24 @@ public class BillingService {
         invoice.balance       = subtotal;
         invoice.persist();
 
+        AuditTrail.log(
+            userId, userName, "CASHIER",
+            "INVOICE_CREATED", "BILLING",
+            "Invoice", String.valueOf(invoice.id),
+            "Invoice created: " + invoice.invoiceNo +
+            " | Patient: " + patient.fullName +
+            " | Total: KES " + invoice.totalAmount +
+            " | Type: " + invoice.invoiceType +
+            " | By: " + userName);
+
         return invoice;
     }
 
     @Transactional
     public Payment recordPayment(Long invoiceId,
             String method, BigDecimal amount,
-            String referenceNo, String cashier) {
+            String referenceNo, String cashier,
+            Long userId, String userName) {
 
         Invoice invoice = Invoice.findById(invoiceId);
         if (invoice == null) {
@@ -90,27 +107,26 @@ public class BillingService {
                     .entity("{\"error\":\"Invoice not found\"}")
                     .build());
         }
-
-        // ── FIX 2: Block payment on locked invoice ────
         if (invoice.status.equals("VOID")) {
             throw new WebApplicationException(
                 Response.status(409)
-                    .entity("{\"error\":\"Cannot pay a voided invoice\"}")
+                    .entity("{\"error\":\"Cannot pay a " +
+                            "voided invoice\"}")
                     .build());
         }
-
         if (invoice.status.equals("PAID")) {
             throw new WebApplicationException(
                 Response.status(409)
-                    .entity("{\"error\":\"Invoice is already fully paid\"}")
+                    .entity("{\"error\":\"Invoice is already " +
+                            "fully paid\"}")
                     .build());
         }
 
-        // ── FIX 3: Auto-generate receipt number ───────
         String receiptNo = "RCP-" +
-            LocalDateTime.now()
-                .format(DateTimeFormatter.ofPattern("yyyyMMdd"))
-            + "-" + String.format("%04d", Payment.count() + 1);
+            LocalDateTime.now().format(
+                DateTimeFormatter.ofPattern("yyyyMMdd"))
+            + "-" + String.format("%04d",
+                Payment.count() + 1);
 
         Payment payment       = new Payment();
         payment.invoice       = invoice;
@@ -118,7 +134,7 @@ public class BillingService {
         payment.amount        = amount;
         payment.referenceNo   = referenceNo;
         payment.receiptNo     = receiptNo;
-        payment.cashier       = cashier;
+        payment.cashier       = userName;
         payment.verified      = method.equals("CASH");
         payment.persist();
 
@@ -127,15 +143,29 @@ public class BillingService {
             .subtract(invoice.paidAmount)
             .max(BigDecimal.ZERO);
         invoice.status     = invoice.balance
-            .compareTo(BigDecimal.ZERO) <= 0 ? "PAID" : "PARTIAL";
+            .compareTo(BigDecimal.ZERO) <= 0 ?
+            "PAID" : "PARTIAL";
         invoice.persist();
+
+        AuditTrail.log(
+            userId, userName, "CASHIER",
+            "PAYMENT_RECORDED", "BILLING",
+            "Invoice", String.valueOf(invoiceId),
+            "Payment of KES " + amount +
+            " via " + method +
+            " | Receipt: " + receiptNo +
+            " | Invoice: " + invoice.invoiceNo +
+            " | Patient: " + invoice.patient.fullName +
+            " | Status: " + invoice.status +
+            " | By: " + userName);
 
         return payment;
     }
 
     @Transactional
     public Payment initiateMpesaPayment(Long invoiceId,
-            String phone, String cashier) {
+            String phone, String cashier,
+            Long userId, String userName) {
 
         Invoice invoice = Invoice.findById(invoiceId);
         if (invoice == null) {
@@ -144,60 +174,67 @@ public class BillingService {
                     .entity("{\"error\":\"Invoice not found\"}")
                     .build());
         }
-
         if (invoice.status.equals("PAID")) {
             throw new WebApplicationException(
                 Response.status(409)
-                    .entity("{\"error\":\"Invoice is already fully paid\"}")
+                    .entity("{\"error\":\"Invoice already paid\"}")
                     .build());
         }
-
         if (invoice.status.equals("VOID")) {
             throw new WebApplicationException(
                 Response.status(409)
-                    .entity("{\"error\":\"Cannot pay a voided invoice\"}")
+                    .entity("{\"error\":\"Cannot pay voided " +
+                            "invoice\"}")
                     .build());
         }
 
-        // ── FIX 1: Block duplicate pending M-Pesa ─────
         long pendingMpesa = Payment.count(
             "invoice.id = ?1 AND paymentMethod = 'MPESA' " +
             "AND verified = false", invoiceId);
         if (pendingMpesa > 0) {
             throw new WebApplicationException(
                 Response.status(409)
-                    .entity("{\"error\":\"A pending M-Pesa payment already " +
-                            "exists for this invoice. Wait for confirmation " +
-                            "or cancel it first.\"}")
+                    .entity("{\"error\":\"A pending M-Pesa " +
+                            "payment already exists\"}")
                     .build());
         }
 
-        // ── FIX 3: Auto-generate receipt number ───────
         String receiptNo = "RCP-" +
-            LocalDateTime.now()
-                .format(DateTimeFormatter.ofPattern("yyyyMMdd"))
-            + "-" + String.format("%04d", Payment.count() + 1);
+            LocalDateTime.now().format(
+                DateTimeFormatter.ofPattern("yyyyMMdd"))
+            + "-" + String.format("%04d",
+                Payment.count() + 1);
 
         Payment payment       = new Payment();
         payment.invoice       = invoice;
         payment.paymentMethod = "MPESA";
         payment.amount        = invoice.balance;
         payment.phoneNumber   = phone;
-        payment.cashier       = cashier;
+        payment.cashier       = userName;
         payment.receiptNo     = receiptNo;
         payment.verified      = false;
         payment.persist();
+
+        AuditTrail.log(
+            userId, userName, "CASHIER",
+            "MPESA_INITIATED", "BILLING",
+            "Invoice", String.valueOf(invoiceId),
+            "M-Pesa STK push: " + invoice.invoiceNo +
+            " | Amount: KES " + invoice.balance +
+            " | Phone: " + phone +
+            " | By: " + userName);
 
         return payment;
     }
 
     @Transactional
-    public void verifyMpesaPayment(String checkoutRequestId,
+    public void verifyMpesaPayment(
+            String checkoutRequestId,
             String mpesaReceipt, BigDecimal amount) {
 
         Payment payment = Payment.find(
-            "referenceNo", checkoutRequestId).firstResult();
-
+            "referenceNo", checkoutRequestId)
+            .firstResult();
         if (payment == null) return;
 
         payment.mpesaReceipt = mpesaReceipt;
@@ -205,19 +242,30 @@ public class BillingService {
         payment.persist();
 
         Invoice invoice    = payment.invoice;
-        invoice.paidAmount = invoice.paidAmount.add(payment.amount);
+        invoice.paidAmount =
+            invoice.paidAmount.add(payment.amount);
         invoice.balance    = invoice.totalAmount
             .subtract(invoice.paidAmount)
             .max(BigDecimal.ZERO);
         invoice.status     = invoice.balance
-            .compareTo(BigDecimal.ZERO) <= 0 ? "PAID" : "PARTIAL";
+            .compareTo(BigDecimal.ZERO) <= 0 ?
+            "PAID" : "PARTIAL";
         invoice.persist();
+
+        AuditTrail.log(
+            null, "Safaricom", "SYSTEM",
+            "MPESA_CONFIRMED", "BILLING",
+            "Invoice", String.valueOf(invoice.id),
+            "M-Pesa confirmed: " + invoice.invoiceNo +
+            " | Receipt: " + mpesaReceipt +
+            " | Amount: KES " + payment.amount +
+            " | Status: " + invoice.status);
     }
 
-    // ── FIX 4: Void invoice — admin only ──────────────
     @Transactional
     public Invoice voidInvoice(Long invoiceId,
-            String reason, String voidedBy) {
+            String reason, String voidedBy,
+            Long userId, String userName) {
 
         Invoice invoice = Invoice.findById(invoiceId);
         if (invoice == null) {
@@ -226,83 +274,101 @@ public class BillingService {
                     .entity("{\"error\":\"Invoice not found\"}")
                     .build());
         }
-
         if (invoice.status.equals("PAID")) {
             throw new WebApplicationException(
                 Response.status(409)
-                    .entity("{\"error\":\"Cannot void a paid invoice. " +
-                            "Issue a refund instead.\"}")
+                    .entity("{\"error\":\"Cannot void a paid " +
+                            "invoice. Issue a refund instead.\"}")
                     .build());
         }
-
         if (invoice.status.equals("VOID")) {
             throw new WebApplicationException(
                 Response.status(409)
-                    .entity("{\"error\":\"Invoice is already voided\"}")
+                    .entity("{\"error\":\"Invoice already " +
+                            "voided\"}")
                     .build());
         }
-
         if (reason == null || reason.isBlank()) {
             throw new WebApplicationException(
                 Response.status(400)
-                    .entity("{\"error\":\"Void reason is mandatory\"}")
+                    .entity("{\"error\":\"Void reason is " +
+                            "mandatory\"}")
                     .build());
         }
 
+        String oldStatus = invoice.status;
         invoice.status   = "VOID";
-        invoice.notes    = "VOIDED by " + voidedBy +
+        invoice.notes    = "VOIDED by " + userName +
                            " | Reason: " + reason +
                            " | Time: " + LocalDateTime.now();
         invoice.persist();
 
+        AuditTrail.logChange(
+            userId, userName, "ADMIN",
+            "INVOICE_VOIDED", "BILLING",
+            "Invoice", String.valueOf(invoiceId),
+            oldStatus, "VOID",
+            "Invoice VOIDED: " + invoice.invoiceNo +
+            " | Patient: " + invoice.patient.fullName +
+            " | Amount: KES " + invoice.totalAmount +
+            " | Reason: " + reason +
+            " | By: " + userName);
+
         return invoice;
     }
 
-    // ── FIX 5: Cashier session ────────────────────────
     @Transactional
     public CashierSession openSession(String cashier,
-            BigDecimal openingFloat) {
+            BigDecimal openingFloat,
+            Long userId, String userName) {
 
-        // Block opening if session already open
-        long openSessions = CashierSession.count(
-            "cashier = ?1 AND status = 'OPEN'", cashier);
-        if (openSessions > 0) {
+        long open = CashierSession.count(
+            "cashier = ?1 AND status = 'OPEN'", userName);
+        if (open > 0) {
             throw new WebApplicationException(
                 Response.status(409)
-                    .entity("{\"error\":\"Cashier already has an open session\"}")
+                    .entity("{\"error\":\"Cashier already has " +
+                            "an open session\"}")
                     .build());
         }
 
-        CashierSession session  = new CashierSession();
-        session.cashier         = cashier;
-        session.openingFloat    = openingFloat;
-        session.status          = "OPEN";
+        CashierSession session = new CashierSession();
+        session.cashier        = userName;
+        session.openingFloat   = openingFloat;
+        session.status         = "OPEN";
         session.persist();
+
+        AuditTrail.log(
+            userId, userName, "CASHIER",
+            "SESSION_OPENED", "BILLING",
+            "CashierSession", String.valueOf(session.id),
+            "Session opened by: " + userName +
+            " | Float: KES " + openingFloat);
 
         return session;
     }
 
     @Transactional
     public CashierSession closeSession(Long sessionId,
-            BigDecimal actualCash) {
+            BigDecimal actualCash,
+            Long userId, String userName) {
 
-        CashierSession session = CashierSession.findById(sessionId);
+        CashierSession session =
+            CashierSession.findById(sessionId);
         if (session == null) {
             throw new WebApplicationException(
                 Response.status(404)
                     .entity("{\"error\":\"Session not found\"}")
                     .build());
         }
-
         if (session.status.equals("CLOSED")) {
             throw new WebApplicationException(
                 Response.status(409)
-                    .entity("{\"error\":\"Session already closed\"}")
+                    .entity("{\"error\":\"Session already " +
+                            "closed\"}")
                     .build());
         }
 
-        // Calculate expected cash from all cash payments
-        // during this session
         BigDecimal expectedCash = Payment.find(
             "paymentMethod = 'CASH' AND verified = true " +
             "AND createdAt >= ?1", session.openedAt)
@@ -310,14 +376,26 @@ public class BillingService {
             .map(p -> ((Payment) p).amount)
             .reduce(BigDecimal.ZERO, BigDecimal::add);
 
-        session.expectedCash = expectedCash
-            .add(session.openingFloat);
+        session.expectedCash =
+            expectedCash.add(session.openingFloat);
         session.actualCash   = actualCash;
-        session.variance     = actualCash
-            .subtract(session.expectedCash);
+        session.variance     =
+            actualCash.subtract(session.expectedCash);
         session.status       = "CLOSED";
         session.closedAt     = LocalDateTime.now();
         session.persist();
+
+        AuditTrail.log(
+            userId, userName, "CASHIER",
+            "SESSION_CLOSED", "BILLING",
+            "CashierSession", String.valueOf(sessionId),
+            "Session closed by: " + userName +
+            " | Expected: KES " + session.expectedCash +
+            " | Actual: KES " + actualCash +
+            " | Variance: KES " + session.variance +
+            (session.variance.compareTo(
+                BigDecimal.ZERO) != 0
+                ? " ⚠ VARIANCE" : " ✓ Balanced"));
 
         return session;
     }
@@ -325,7 +403,8 @@ public class BillingService {
     @Transactional
     public InsuranceClaim submitClaim(Long invoiceId,
             Long providerId, String memberNo,
-            BigDecimal amount) {
+            BigDecimal amount,
+            Long userId, String userName) {
 
         Invoice invoice = Invoice.findById(invoiceId);
         if (invoice == null) {
@@ -334,44 +413,35 @@ public class BillingService {
                     .entity("{\"error\":\"Invoice not found\"}")
                     .build());
         }
-
         InsuranceProvider provider =
             InsuranceProvider.findById(providerId);
         if (provider == null) {
             throw new WebApplicationException(
                 Response.status(404)
-                    .entity("{\"error\":\"Insurance provider not found\"}")
+                    .entity("{\"error\":\"Provider not found\"}")
                     .build());
         }
-
-        long existingClaims = InsuranceClaim.count(
-            "invoice.id = ?1 AND status != 'REJECTED'", invoiceId);
-        if (existingClaims > 0) {
+        long existing = InsuranceClaim.count(
+            "invoice.id = ?1 AND status != 'REJECTED'",
+            invoiceId);
+        if (existing > 0) {
             throw new WebApplicationException(
                 Response.status(409)
-                    .entity("{\"error\":\"A claim already exists for this invoice\"}")
+                    .entity("{\"error\":\"Claim already " +
+                            "exists for this invoice\"}")
                     .build());
         }
-
         if (amount.compareTo(invoice.totalAmount) > 0) {
             throw new WebApplicationException(
                 Response.status(400)
-                    .entity("{\"error\":\"Claimed amount exceeds invoice total\"}")
-                    .build());
-        }
-
-        if (invoice.status.equals("PAID") &&
-                invoice.paidAmount.compareTo(invoice.totalAmount) >= 0 &&
-                invoice.insuranceAmount.compareTo(BigDecimal.ZERO) == 0) {
-            throw new WebApplicationException(
-                Response.status(409)
-                    .entity("{\"error\":\"Invoice already fully paid in cash\"}")
+                    .entity("{\"error\":\"Claimed amount " +
+                            "exceeds invoice total\"}")
                     .build());
         }
 
         String claimNo = "CLM-" +
-            LocalDateTime.now()
-                .format(DateTimeFormatter.ofPattern("yyyyMMdd"))
+            LocalDateTime.now().format(
+                DateTimeFormatter.ofPattern("yyyyMMdd"))
             + "-" + String.format("%04d",
                 InsuranceClaim.count() + 1);
 
@@ -386,11 +456,23 @@ public class BillingService {
         claim.persist();
 
         invoice.insuranceAmount = amount;
-        invoice.patientAmount   = invoice.totalAmount.subtract(amount);
+        invoice.patientAmount   =
+            invoice.totalAmount.subtract(amount);
         invoice.balance         = invoice.patientAmount
             .subtract(invoice.paidAmount)
             .max(BigDecimal.ZERO);
         invoice.persist();
+
+        AuditTrail.log(
+            userId, userName, "CASHIER",
+            "CLAIM_SUBMITTED", "BILLING",
+            "Invoice", String.valueOf(invoiceId),
+            "Claim submitted: " + claimNo +
+            " | Provider: " + provider.name +
+            " | Patient: " + invoice.patient.fullName +
+            " | Amount: KES " + amount +
+            " | Member: " + memberNo +
+            " | By: " + userName);
 
         return claim;
     }
@@ -398,43 +480,71 @@ public class BillingService {
     @Transactional
     public InsuranceClaim updateClaimStatus(Long claimId,
             String status, BigDecimal approvedAmount,
-            String refNo, String rejectionReason) {
+            String refNo, String rejectionReason,
+            Long userId, String userName) {
 
-        InsuranceClaim claim = InsuranceClaim.findById(claimId);
+        InsuranceClaim claim =
+            InsuranceClaim.findById(claimId);
         if (claim == null) {
             throw new WebApplicationException(
                 Response.status(404)
                     .entity("{\"error\":\"Claim not found\"}")
                     .build());
         }
-
         if (approvedAmount != null &&
-                approvedAmount.compareTo(claim.amountClaimed) > 0) {
+                approvedAmount.compareTo(
+                    claim.amountClaimed) > 0) {
             throw new WebApplicationException(
                 Response.status(400)
-                    .entity("{\"error\":\"Approved amount exceeds claimed amount\"}")
+                    .entity("{\"error\":\"Approved amount " +
+                            "exceeds claimed amount\"}")
                     .build());
         }
 
-        claim.status = status;
-        if (approvedAmount != null) claim.amountApproved = approvedAmount;
-        if (refNo != null)          claim.claimRefNo     = refNo;
-        if (rejectionReason != null) claim.rejectionReason = rejectionReason;
-        if (status.equals("APPROVED")) claim.approvalDate = LocalDateTime.now();
+        String oldStatus  = claim.status;
+        claim.status      = status;
+        if (approvedAmount != null)
+            claim.amountApproved  = approvedAmount;
+        if (refNo != null)
+            claim.claimRefNo      = refNo;
+        if (rejectionReason != null)
+            claim.rejectionReason = rejectionReason;
+        if (status.equals("APPROVED"))
+            claim.approvalDate    = LocalDateTime.now();
         if (status.equals("PAID")) {
             claim.paymentDate = LocalDateTime.now();
             claim.amountPaid  = claim.amountApproved;
         }
         claim.persist();
+
+        AuditTrail.logChange(
+            userId, userName, "CASHIER",
+            "CLAIM_STATUS_UPDATED", "BILLING",
+            "InsuranceClaim", String.valueOf(claimId),
+            oldStatus, status,
+            "Claim " + claim.claimNo +
+            " updated from " + oldStatus +
+            " to " + status +
+            (refNo != null ? " | Ref: " + refNo : "") +
+            " | By: " + userName);
+
         return claim;
     }
 
-    public List<Invoice>           getPatientInvoices(Long p)  { return Invoice.findByPatient(p); }
-    public List<Invoice>           getPendingInvoices()         { return Invoice.findPending(); }
-    public List<InvoiceItem>       getInvoiceItems(Long invId)  { return InvoiceItem.findByInvoice(invId); }
-    public List<Payment>           getPayments(Long invId)      { return Payment.findByInvoice(invId); }
-    public List<InsuranceProvider> getProviders()               { return InsuranceProvider.findAllActive(); }
-    public List<InsuranceClaim>    getClaimsByStatus(String s)  { return InsuranceClaim.findByStatus(s); }
-    public List<InsuranceClaim>    getClaimsByProvider(Long p)  { return InsuranceClaim.findByProvider(p); }
-    public List<CashierSession>    getOpenSessions()            { return CashierSession.findOpen(); }
+    public List<Invoice> getPatientInvoices(Long p) {
+        return Invoice.findByPatient(p); }
+    public List<Invoice> getPendingInvoices() {
+        return Invoice.findPending(); }
+    public List<InvoiceItem> getInvoiceItems(Long id) {
+        return InvoiceItem.findByInvoice(id); }
+    public List<Payment> getPayments(Long id) {
+        return Payment.findByInvoice(id); }
+    public List<InsuranceProvider> getProviders() {
+        return InsuranceProvider.findAllActive(); }
+    public List<InsuranceClaim> getClaimsByStatus(String s) {
+        return InsuranceClaim.findByStatus(s); }
+    public List<InsuranceClaim> getClaimsByProvider(Long p) {
+        return InsuranceClaim.findByProvider(p); }
+    public List<CashierSession> getOpenSessions() {
+        return CashierSession.findOpen(); }
 }

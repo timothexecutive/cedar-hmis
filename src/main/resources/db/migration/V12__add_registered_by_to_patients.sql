@@ -1,0 +1,1 @@
+ALTER TABLE patients ADD COLUMN IF NOT EXISTS registered_by VARCHAR(255);

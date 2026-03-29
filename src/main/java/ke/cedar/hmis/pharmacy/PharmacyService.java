@@ -4,10 +4,9 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.transaction.Transactional;
 import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.core.Response;
+import ke.cedar.hmis.audit.AuditTrail;
 import ke.cedar.hmis.reception.Patient;
 import ke.cedar.hmis.opd.Visit;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Map;
 
@@ -15,9 +14,58 @@ import java.util.Map;
 public class PharmacyService {
 
     @Transactional
-    public Prescription createPrescription(Long patientId,
-            Long visitId, String prescribedBy,
-            String notes, List<Map<String, Object>> items) {
+    public Drug updateStock(Long drugId,
+            Integer quantity, String type,
+            Long userId, String userName) {
+
+        Drug drug = Drug.findById(drugId);
+        if (drug == null) {
+            throw new WebApplicationException(
+                Response.status(404)
+                    .entity("{\"error\":\"Drug not found\"}")
+                    .build());
+        }
+
+        int oldStock = drug.currentStock;
+
+        if ("ADD".equals(type)) {
+            drug.currentStock += quantity;
+        } else if ("DEDUCT".equals(type)) {
+            if (drug.currentStock < quantity) {
+                throw new WebApplicationException(
+                    Response.status(409)
+                        .entity("{\"error\":\"Insufficient " +
+                                "stock\"}")
+                        .build());
+            }
+            drug.currentStock -= quantity;
+        } else {
+            drug.currentStock = quantity;
+        }
+
+        drug.persist();
+
+        AuditTrail.logChange(
+            userId, userName, "PHARMACIST",
+            "STOCK_UPDATED", "PHARMACY",
+            "Drug", String.valueOf(drugId),
+            String.valueOf(oldStock),
+            String.valueOf(drug.currentStock),
+            "Stock updated: " + drug.name +
+            " | Type: " + type +
+            " | Qty: " + quantity +
+            " | New stock: " + drug.currentStock +
+            " | By: " + userName);
+
+        return drug;
+    }
+
+    @Transactional
+    public Prescription createPrescription(
+            Long patientId, Long visitId,
+            String prescribedBy, String notes,
+            List<Map<String, Object>> items,
+            Long userId, String userName) {
 
         Patient patient = Patient.findById(patientId);
         if (patient == null) {
@@ -27,56 +75,62 @@ public class PharmacyService {
                     .build());
         }
 
-        String rxNo = "RX-" +
-            LocalDateTime.now()
-                .format(DateTimeFormatter.ofPattern("yyyyMMdd"))
-            + "-" + String.format("%04d",
-                Prescription.count() + 1);
+        long count = Prescription.count() + 1;
+        String rxNo = String.format("RX-%s-%04d",
+            java.time.LocalDate.now().toString()
+                .replace("-",""), count);
 
-        Prescription prescription    = new Prescription();
-        prescription.prescriptionNo  = rxNo;
-        prescription.patient         = patient;
-        prescription.prescribedBy    = prescribedBy;
-        prescription.notes           = notes;
-        prescription.status          = "PENDING";
+        Prescription rx = new Prescription();
+        rx.patient        = patient;
+        rx.prescriptionNo = rxNo;
+        rx.prescribedBy   = userName;
+        rx.notes          = notes;
+        rx.status         = "PENDING";
 
         if (visitId != null) {
             Visit visit = Visit.findById(visitId);
-            if (visit != null) prescription.visit = visit;
+            if (visit != null) rx.visit = visit;
         }
 
-        prescription.persist();
+        rx.persist();
 
-        // Add each drug item
         for (Map<String, Object> item : items) {
-            Long drugId = Long.parseLong(item.get("drugId").toString());
-            Drug drug   = Drug.findById(drugId);
-            if (drug == null) continue;
-
-            PrescriptionItem rxItem   = new PrescriptionItem();
-            rxItem.prescription       = prescription;
-            rxItem.drug               = drug;
-            rxItem.dosage             = (String) item.get("dosage");
-            rxItem.frequency          = (String) item.get("frequency");
-            rxItem.duration           = (String) item.get("duration");
-            rxItem.quantity           = Integer.parseInt(
-                item.get("quantity").toString());
-            rxItem.instructions       = (String) item.get("instructions");
-            rxItem.persist();
+            PrescriptionItem pi = new PrescriptionItem();
+            pi.prescription     = rx;
+            pi.drug = Drug.findById(Long.parseLong(
+                item.get("drugId").toString()));
+            pi.dosage       = (String) item.get("dosage");
+            pi.frequency    = (String) item.get("frequency");
+            pi.duration     = (String) item.get("duration");
+            pi.instructions = (String) item.get("instructions");
+            pi.status       = "PENDING";
+            pi.persist();
         }
 
-        return prescription;
+        AuditTrail.log(
+            userId, userName, "DOCTOR",
+            "PRESCRIPTION_CREATED", "PHARMACY",
+            "Prescription", String.valueOf(rx.id),
+            "Prescription: " + rxNo +
+            " | Patient: " + patient.fullName +
+            " | Items: " + items.size() +
+            " | By: " + userName);
+
+        return rx;
     }
 
     @Transactional
-    public Dispensing dispenseDrug(Long prescriptionId,
-            Long drugId, Integer quantity, String dispensedBy) {
+    public Dispensing dispenseDrug(Long rxId,
+            Long drugId, Integer quantity,
+            String dispensedBy,
+            Long userId, String userName) {
 
-        Prescription prescription = Prescription.findById(prescriptionId);
-        if (prescription == null) {
+        Prescription rx = Prescription.findById(rxId);
+        if (rx == null) {
             throw new WebApplicationException(
                 Response.status(404)
-                    .entity("{\"error\":\"Prescription not found\"}")
+                    .entity("{\"error\":\"Prescription " +
+                            "not found\"}")
                     .build());
         }
 
@@ -88,75 +142,72 @@ public class PharmacyService {
                     .build());
         }
 
-        // Check stock
         if (drug.currentStock < quantity) {
             throw new WebApplicationException(
                 Response.status(409)
-                    .entity("{\"error\":\"Insufficient stock. Available: "
-                        + drug.currentStock + "\"}")
+                    .entity("{\"error\":\"Insufficient stock. " +
+                            "Available: " +
+                            drug.currentStock + "\"}")
                     .build());
         }
 
-        // Deduct stock
         drug.currentStock -= quantity;
         drug.persist();
 
-        // Record dispensing
-        Dispensing dispensing       = new Dispensing();
-        dispensing.prescription     = prescription;
-        dispensing.drug             = drug;
-        dispensing.quantity         = quantity;
-        dispensing.dispensedBy      = dispensedBy;
+        Dispensing dispensing   = new Dispensing();
+        dispensing.prescription = rx;
+        dispensing.drug         = drug;
+        dispensing.quantity     = quantity;
+        dispensing.dispensedBy  = userName;
+        // patient, unitPrice, total are not fields on Dispensing entity.
+        // Patient is accessible via dispensing.prescription.patient
+        // Pricing fields should be added to Dispensing entity if needed.
         dispensing.persist();
 
-        // Update prescription item status
-        List<PrescriptionItem> items =
-            PrescriptionItem.findByPrescription(prescriptionId);
-        for (PrescriptionItem item : items) {
-            if (item.drug.id.equals(drugId)) {
-                item.status = "DISPENSED";
-                item.persist();
-            }
-        }
+        rx.status = "DISPENSED";
+        rx.persist();
 
-        // Check if all items dispensed
-        boolean allDispensed = items.stream()
-            .allMatch(i -> i.status.equals("DISPENSED"));
-        prescription.status = allDispensed ? "DISPENSED" : "PARTIAL";
-        prescription.persist();
+        AuditTrail.log(
+            userId, userName, "PHARMACIST",
+            "DRUG_DISPENSED", "PHARMACY",
+            "Prescription", String.valueOf(rxId),
+            "Dispensed: " + drug.name +
+            " | Qty: " + quantity +
+            " | Patient: " + rx.patient.fullName +
+            " | Stock left: " + drug.currentStock +
+            " | By: " + userName);
 
         return dispensing;
     }
 
-    @Transactional
-    public Drug updateStock(Long drugId, Integer quantity, String type) {
-        Drug drug = Drug.findById(drugId);
-        if (drug == null) {
-            throw new WebApplicationException(
-                Response.status(404)
-                    .entity("{\"error\":\"Drug not found\"}")
-                    .build());
-        }
-        if (type.equals("ADD")) {
-            drug.currentStock += quantity;
-        } else {
-            if (drug.currentStock < quantity) {
-                throw new WebApplicationException(
-                    Response.status(409)
-                        .entity("{\"error\":\"Insufficient stock\"}")
-                        .build());
-            }
-            drug.currentStock -= quantity;
-        }
-        drug.persist();
-        return drug;
+    public List<Drug> getAllDrugs() {
+        return Drug.listAll();
     }
 
-    public List<Drug>         getAllDrugs()                  { return Drug.findAllActive(); }
-    public List<Drug>         getLowStock()                  { return Drug.findLowStock(); }
-    public List<Drug>         searchDrugs(String q)          { return Drug.search(q); }
-    public List<Prescription> getPending()                   { return Prescription.findPending(); }
-    public List<Prescription> getPatientPrescriptions(Long p){ return Prescription.findByPatient(p); }
-    public List<PrescriptionItem> getItems(Long rxId)        { return PrescriptionItem.findByPrescription(rxId); }
-    public List<Dispensing>   getDispensing(Long rxId)       { return Dispensing.findByPrescription(rxId); }
+    public List<Drug> searchDrugs(String query) {
+        if (query == null || query.isBlank())
+            return Drug.listAll();
+        return Drug.search(query);
+    }
+
+    public List<Drug> getLowStock() {
+        return Drug.findLowStock();
+    }
+
+    public List<Prescription> getPending() {
+        return Prescription.findPending();
+    }
+
+    public List<Prescription> getPatientPrescriptions(
+            Long patientId) {
+        return Prescription.findByPatient(patientId);
+    }
+
+    public List<PrescriptionItem> getItems(Long rxId) {
+        return PrescriptionItem.findByPrescription(rxId);
+    }
+
+    public List<Dispensing> getDispensing(Long rxId) {
+        return Dispensing.findByPrescription(rxId);
+    }
 }

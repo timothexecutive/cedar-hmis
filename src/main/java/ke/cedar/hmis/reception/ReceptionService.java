@@ -4,6 +4,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.transaction.Transactional;
 import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.core.Response;
+import ke.cedar.hmis.audit.AuditTrail;
 import java.time.Year;
 import java.util.List;
 
@@ -11,13 +12,18 @@ import java.util.List;
 public class ReceptionService {
 
     @Transactional
-    public Patient registerPatient(Patient request) {
-        if (request.nationalId != null && !request.nationalId.isBlank()) {
-            Patient existing = Patient.findByNationalId(request.nationalId);
+    public Patient registerPatient(Patient request,
+            Long userId, String userName) {
+        if (request.nationalId != null &&
+                !request.nationalId.isBlank()) {
+            Patient existing = Patient.findByNationalId(
+                request.nationalId);
             if (existing != null) {
                 throw new WebApplicationException(
                     Response.status(409)
-                        .entity("{\"error\":\"Patient with this National ID already exists\"}")
+                        .entity("{\"error\":\"Patient with " +
+                                "this National ID already " +
+                                "exists\"}")
                         .build());
             }
         }
@@ -27,6 +33,17 @@ public class ReceptionService {
         request.isSHAMember = request.shaMemberNo != null
                 && !request.shaMemberNo.isBlank();
         request.persist();
+
+        AuditTrail.log(
+            userId, userName, "RECEPTIONIST",
+            "PATIENT_REGISTERED", "RECEPTION",
+            "Patient", String.valueOf(request.id),
+            "New patient registered: " + request.fullName +
+            " | PatientNo: " + request.patientNo +
+            " | NationalID: " + request.nationalId +
+            " | SHA: " + (request.isSHAMember ? "Yes":"No") +
+            " | By: " + userName);
+
         return request;
     }
 

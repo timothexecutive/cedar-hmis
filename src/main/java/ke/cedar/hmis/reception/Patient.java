@@ -13,6 +13,9 @@ public class Patient extends PanacheEntity {
     @Column(name = "patient_no", unique = true, nullable = false)
     public String patientNo;
 
+    @Column(name = "registered_by")
+    public String registeredBy;
+
     @Column(name = "full_name", nullable = false)
     public String fullName;
 
